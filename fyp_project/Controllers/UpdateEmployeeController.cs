@@ -1,4 +1,3 @@
-```csharp
 using fyp_project.DTOs;
 using fyp_project.Models;
 using Microsoft.AspNetCore.Authorization;
@@ -194,4 +193,3 @@ namespace fyp_project.Controllers
         }
     }
 }
-```

@@ -1,4 +1,3 @@
-```csharp
 using fyp_project.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -119,4 +118,3 @@ namespace fyp_project.Controllers
         }
     }
 }
-```

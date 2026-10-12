@@ -1,4 +1,5 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using fyp_project.Models;
 using fyp_project.DTO;
@@ -13,15 +14,18 @@ namespace fyp_project.Controllers
         private readonly WorkforceManagementDbContext _context;
         private readonly TokenService _tokenService;
         private readonly EmailService _emailService;
+        private readonly ILogger<UserLoginController> _logger;
 
         public UserLoginController(
             WorkforceManagementDbContext context,
             TokenService tokenService,
-            EmailService emailService)
+            EmailService emailService,
+            ILogger<UserLoginController> logger)
         {
             _context = context;
             _tokenService = tokenService;
             _emailService = emailService;
+            _logger = logger;
         }
 
         [HttpPost("loginUser")]
@@ -29,9 +33,23 @@ namespace fyp_project.Controllers
         {
             try
             {
-                // 1. Email se user retrieve karo
+                // 1. Validate request
+                if (obj == null ||
+                    string.IsNullOrWhiteSpace(obj.Email) ||
+                    string.IsNullOrWhiteSpace(obj.Password) ||
+                    string.IsNullOrWhiteSpace(obj.RoleName))
+                {
+                    return BadRequest(new
+                    {
+                        message = "Email, password, and role are required."
+                    });
+                }
+
+                // 2. Find user by email
+                var email = obj.Email.Trim();
+
                 var user = await _context.Users
-                    .FirstOrDefaultAsync(u => u.Email == obj.Email);
+                    .FirstOrDefaultAsync(u => u.Email == email);
 
                 if (user == null)
                 {
@@ -41,7 +59,7 @@ namespace fyp_project.Controllers
                     });
                 }
 
-                // 2. Check karo account active hai ya nahi
+                // 3. Check account status
                 if (!user.IsActive)
                 {
                     return Unauthorized(new
@@ -50,13 +68,41 @@ namespace fyp_project.Controllers
                     });
                 }
 
-                // 3. Password verify karo
-                bool passwordVerify = BCrypt.Net.BCrypt.Verify(
-                    obj.Password,
-                    user.PasswordHash
-                );
+                // 4. Verify password hash
+                if (string.IsNullOrWhiteSpace(user.PasswordHash))
+                {
+                    _logger.LogError(
+                        "User {UserId} has no password hash.",
+                        user.UserId);
 
-                if (!passwordVerify)
+                    return Unauthorized(new
+                    {
+                        message = "Invalid email or password."
+                    });
+                }
+
+                bool passwordVerified;
+
+                try
+                {
+                    passwordVerified = BCrypt.Net.BCrypt.Verify(
+                        obj.Password,
+                        user.PasswordHash);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Password verification failed for user {UserId}.",
+                        user.UserId);
+
+                    return StatusCode(500, new
+                    {
+                        message = "Unable to verify credentials."
+                    });
+                }
+
+                if (!passwordVerified)
                 {
                     return Unauthorized(new
                     {
@@ -64,20 +110,28 @@ namespace fyp_project.Controllers
                     });
                 }
 
-                // 4. Actual role database se retrieve karo
+                // 5. Retrieve actual role from database
                 var role = await _context.Roles
                     .FirstOrDefaultAsync(r => r.RoleId == user.RoleId);
 
-                if (role == null)
+                if (role == null ||
+                    string.IsNullOrWhiteSpace(role.RoleName))
                 {
-                    return Forbid();
+                    _logger.LogError(
+                        "Role not found for user {UserId}.",
+                        user.UserId);
+
+                    return StatusCode(500, new
+                    {
+                        message = "User role is not configured correctly."
+                    });
                 }
 
                 string actualRole = role.RoleName;
 
-                // 5. Browser se bheje gaye role ko compare karo
+                // 6. Validate supplied role
                 if (!string.Equals(
-                    obj.RoleName,
+                    obj.RoleName.Trim(),
                     actualRole,
                     StringComparison.OrdinalIgnoreCase))
                 {
@@ -87,7 +141,7 @@ namespace fyp_project.Controllers
                     });
                 }
 
-                // 6. Sirf Admin ko login karne do
+                // 7. Only Admin can use this login endpoint
                 if (!string.Equals(
                     actualRole,
                     "Admin",
@@ -99,33 +153,48 @@ namespace fyp_project.Controllers
                     });
                 }
 
-                // 7. JWT generate karo
+                // 8. Generate JWT
                 var token = _tokenService.CreateToken(
                     user.UserId,
                     user.Email,
-                    actualRole
-                );
+                    actualRole);
 
-                // 8. JWT HttpOnly cookie mein store karo
+                if (string.IsNullOrWhiteSpace(token))
+                {
+                    _logger.LogError(
+                        "JWT generation returned an empty token for user {UserId}.",
+                        user.UserId);
+
+                    return StatusCode(500, new
+                    {
+                        message = "Unable to create authentication token."
+                    });
+                }
+
+                // 9. Update last login before issuing the cookie
+                user.LastLogin = DateTime.UtcNow;
+
+                await _context.SaveChangesAsync();
+
+                // 10. Store JWT in HttpOnly cookie
                 Response.Cookies.Append(
                     "accessToken",
                     token,
                     new CookieOptions
                     {
                         HttpOnly = true,
+
+                        // Secure cookies require HTTPS.
                         Secure = true,
+
                         SameSite = SameSiteMode.Strict,
+
                         Expires = DateTimeOffset.UtcNow.AddDays(1),
+
                         Path = "/"
-                    }
-                );
+                    });
 
-                // 9. Last login update karo
-                user.LastLogin = DateTime.UtcNow;
-
-                await _context.SaveChangesAsync();
-
-                // 10. User DTO banao
+                // 11. Create response DTO
                 var userDTO = new UserDTO
                 {
                     UserId = user.UserId,
@@ -134,16 +203,28 @@ namespace fyp_project.Controllers
                     RoleName = actualRole
                 };
 
-                // 11. Login notification
-                await _emailService.SendEmailAsync(
-                    user.Email,
-                    "Login Notification",
-                    $"Hello {user.FullName},\n\n" +
-                    $"You have successfully logged in at {DateTime.UtcNow} UTC.\n\n" +
-                    "If this wasn't you, please contact support."
-                );
+                // 12. Send login notification separately.
+                // Email failure should not invalidate successful login.
+                try
+                {
+                    await _emailService.SendEmailAsync(
+                        user.Email,
+                        "Login Notification",
+                        $"Hello {user.FullName},\n\n" +
+                        $"You successfully logged in at " +
+                        $"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC.\n\n" +
+                        "If this wasn't you, please contact support."
+                    );
+                }
+                catch (Exception emailEx)
+                {
+                    _logger.LogError(
+                        emailEx,
+                        "Login notification email failed for user {UserId}.",
+                        user.UserId);
+                }
 
-                // 12. Response return karo
+                // 13. Return success response
                 return Ok(new
                 {
                     message = "Login successful.",
@@ -152,7 +233,12 @@ namespace fyp_project.Controllers
             }
             catch (Exception ex)
             {
-                // Production mein exception details client ko return na karo.
+                // Log the complete exception on the server.
+                _logger.LogError(
+                    ex,
+                    "Unexpected error occurred during login.");
+
+                // Do not expose internal exception details to clients.
                 return StatusCode(500, new
                 {
                     message = "An error occurred while logging in."
